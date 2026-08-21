@@ -166,6 +166,18 @@ function sanitizeName(
 
 
 /**
+ * Export label for one body split from a multi-body component.
+ * Example: "112801971_0001_body1", "112801971_0001_body2"
+ */
+function splitBodyExportLabel(
+  componentLabel: string,
+  bodyIndex: number
+): string {
+  return `${sanitizeName(componentLabel)}_body${bodyIndex + 1}`;
+}
+
+
+/**
  * Builds a unique STEP output path within the output directory.
  */
 function uniqueOutputPath(
@@ -340,6 +352,9 @@ function splitComponentBodiesIntoUnits(
       body.name ||
       `body_${i + 1}`;
 
+    const exportLabel =
+      splitBodyExportLabel(labelPrefix, i);
+
     try {
       const matrix =
         adsk.core.Matrix3D.create();
@@ -351,8 +366,7 @@ function splitComponentBodiesIntoUnits(
       const newComponent =
         occurrence.component;
 
-      newComponent.name =
-        `${labelPrefix}_${sanitizeName(bodyName)}`;
+      newComponent.name = exportLabel;
 
       placeBodyInComponent(
         parentDesign,
@@ -361,7 +375,7 @@ function splitComponentBodiesIntoUnits(
       );
 
       units.push({
-        label: newComponent.name,
+        label: exportLabel,
         component: newComponent,
         sourceKind: "split-body",
       });
@@ -369,7 +383,7 @@ function splitComponentBodiesIntoUnits(
     } catch (err) {
       adsk.log(
         `Could not split body "${bodyName}" ` +
-        `out of "${labelPrefix}": ${err}`
+        `out of "${labelPrefix}" as "${exportLabel}": ${err}`
       );
     }
   }

@@ -7,12 +7,41 @@ This repo contains:
 - **`batch-export.ts`** — Fusion worker that runs inside Autodesk Platform Services (APS) Design Automation
 - **`scripts/`** — CLI tools to deploy the worker and a **reference implementation** for submitting export jobs
 
-The website/backend team does **not** run `batch-export.ts` on their server. They call APS APIs to upload a file, submit a WorkItem, poll for completion, and download the result zip.
+The website/backend team clones this repo, uses the scripts below, and wires the export flow into their own API. They do **not** run `batch-export.ts` on their server — that runs in APS. They also do **not** need to redeploy the Fusion worker unless export logic in `batch-export.ts` changes (that is handled separately via `npm run appbundle`).
 
 ---
 
-## Deployed resources
+## Getting started (website backend)
 
+```bash
+git clone https://github.com/Steven-Tran04/batch-export.git
+cd batch-export
+npm install
+cp .env.example .env
+# Fill in APS credentials (shared separately)
+npm run export -- --input path/to/test.stp
+```
+
+If the CLI export succeeds, APS credentials and the deployed Activity are configured correctly. Next step: port the same flow into your web backend.
+
+### Files to use
+
+| File | Purpose |
+|------|---------|
+| `scripts/export-service.ts` | Submit job, poll status, download zip, OSS cleanup |
+| `scripts/aps-common.ts` | APS tokens, OSS upload/download/delete |
+| `scripts/create-workitem.ts` | Full end-to-end reference (CLI version of the website flow) |
+
+### Files you can ignore
+
+| File | Why |
+|------|-----|
+| `batch-export.ts` | Fusion worker — already deployed on APS |
+| `scripts/create-appbundle.ts` | Worker deployment only |
+| `scripts/create-activity.ts` | Activity deployment only |
+| `scripts/aps-auth.ts` | Hub/OAuth path — not needed for drag-and-drop |
+
+---
 These are already registered on APS (update versions via `npm run appbundle` / `npm run activity`):
 
 | Resource | ID |
@@ -31,7 +60,7 @@ Phamtec.BatchExportActivity+dev
 
 ---
 
-## Website integration (drag-and-drop)
+## Deployed resources
 
 For a public upload form (`.stp`, `.step`, or `.f3d`), use the **OSS input path**. End users do **not** need an Autodesk account or OAuth sign-in.
 
@@ -55,7 +84,7 @@ On success: download zip from OSS → return to user
 | 4. Poll status | `GET https://developer.api.autodesk.com/da/{region}/v3/workitems/{id}` |
 | 5. Download result | OSS signed download — see `downloadBucketObject()` in `scripts/aps-common.ts` |
 
-**Reference implementation:** `scripts/create-workitem.ts` (upload → submit → poll → download). Port this logic into your API routes.
+**Reference implementation:** `scripts/create-workitem.ts` and `scripts/export-service.ts`. Import or copy these into your backend routes.
 
 ### Suggested API surface
 
@@ -224,8 +253,9 @@ batch-export.ts                 Fusion worker (deployed to APS)
 BatchExportAppBundle/
   PackageContents.xml             AppBundle manifest
 scripts/
-  create-workitem.ts              Reference: submit + poll + download
-  aps-common.ts                   Tokens, OSS upload/download, helpers
+  export-service.ts             Export logic to use in your backend
+  create-workitem.ts            CLI + end-to-end reference
+  aps-common.ts                 Tokens, OSS upload/download, helpers
   create-appbundle.ts             Deploy worker updates
   create-activity.ts              Deploy activity updates
   aps-auth.ts                     Fusion Team OAuth (hub path only)
