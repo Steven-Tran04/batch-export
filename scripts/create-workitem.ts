@@ -7,6 +7,7 @@ import {
     APS_REGION,
     WorkItemInput,
     buildOssObjectUrn,
+    deleteBucketObjects,
     downloadBucketObject,
     ensureBucket,
     getInputLocalName,
@@ -17,7 +18,7 @@ import {
     resolveWorkItemTarget,
     uploadBucketObject,
 } from "./aps-common";
-import { getCliValue, parseCliArgs } from "./cli-args";
+import { getCliValue, hasCliFlag, parseCliArgs } from "./cli-args";
 
 async function createWorkItem(
     token: string,
@@ -417,6 +418,28 @@ async function main() {
         );
 
         console.log("Saved:", outputPath);
+
+        if (!hasCliFlag(args, "keep-oss")) {
+            const objectKeysToDelete = [outputObjectKey];
+
+            if (input.mode === "oss") {
+                objectKeysToDelete.push(input.inputObjectKey);
+            }
+
+            console.log(
+                `\nCleaning up ${objectKeysToDelete.length} OSS object(s)...`
+            );
+
+            await deleteBucketObjects(
+                token,
+                APS_BUCKET_KEY,
+                objectKeysToDelete
+            );
+        } else {
+            console.log(
+                "\nSkipping OSS cleanup (--keep-oss)."
+            );
+        }
     }
 
     console.log("\nWorkItem completed successfully.");

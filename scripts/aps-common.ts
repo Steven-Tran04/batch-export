@@ -593,6 +593,66 @@ export async function downloadBucketObject(
     writeFileSync(destinationPath, bytes);
 }
 
+/**
+ * Deletes one object from an OSS bucket. Requires data:write scope.
+ * Best-effort: callers may catch/log failures without failing the export.
+ */
+export async function deleteBucketObject(
+    token: string,
+    bucketKey: string,
+    objectKey: string
+): Promise<void> {
+    const url =
+        "https://developer.api.autodesk.com/oss/v2/buckets/" +
+        `${encodeURIComponent(bucketKey)}/objects/` +
+        `${encodeURIComponent(objectKey)}`;
+
+    const response = await fetch(url, {
+        method: "DELETE",
+        headers: {
+            Authorization: `Bearer ${token}`,
+        },
+    });
+
+    if (response.status === 404) {
+        return;
+    }
+
+    if (!response.ok) {
+        const text = await response.text();
+        throw new Error(
+            `Failed to delete OSS object ${objectKey}: ` +
+                `${response.status}\n${text}`
+        );
+    }
+}
+
+/**
+ * Deletes OSS objects used by a completed export job.
+ * Individual failures are logged but do not throw.
+ */
+export async function deleteBucketObjects(
+    token: string,
+    bucketKey: string,
+    objectKeys: string[]
+): Promise<void> {
+    for (const objectKey of objectKeys) {
+        try {
+            await deleteBucketObject(
+                token,
+                bucketKey,
+                objectKey
+            );
+
+            console.log(`Deleted OSS object: ${objectKey}`);
+        } catch (error) {
+            console.warn(
+                `Could not delete OSS object ${objectKey}: ${error}`
+            );
+        }
+    }
+}
+
 export async function upsertAlias(
     token: string,
     resourceKind: "activities" | "appbundles",

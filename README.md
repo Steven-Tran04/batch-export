@@ -177,6 +177,9 @@ npm run export -- --input "path\to\assembly.stp"
 
 # Re-use an already-uploaded OSS object:
 npm run export -- --oss-key inputs/some-uuid.stp
+
+# Keep input/output in OSS after export (debugging):
+npm run export -- --input "path\to\assembly.stp" --keep-oss
 ```
 
 Successful runs download the zip to `output/{workItemId}.zip`.
@@ -207,7 +210,8 @@ Poll WorkItem status every ~5 seconds. Show a progress indicator in the UI for l
 
 - Keep all APS credentials on the **backend** only
 - Add file size limits and rate limiting on your API
-- Set OSS lifecycle rules to delete `inputs/*` and `exports/*` after 24–72 hours
+- **Delete OSS objects after each job** — the CLI does this automatically after a successful download (input + output zip). Pass `--keep-oss` to skip cleanup for debugging. The website backend should call `deleteBucketObject()` from `scripts/aps-common.ts` after delivering the zip to the user
+- As a safety net, set OSS lifecycle rules to delete `inputs/*` and `exports/*` after 24–72 hours
 - Monitor APS Design Automation usage and billing
 - For production, consider promoting the activity alias from `dev` to `prod`
 
