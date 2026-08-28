@@ -86,6 +86,10 @@ On success: download zip from OSS → return to user
 
 **Reference implementation:** `scripts/create-workitem.ts` and `scripts/export-service.ts`. Import or copy these into your backend routes.
 
+### Hosting the website API
+
+This repo does **not** include a hosted API service. The website team implements the suggested endpoints below in whatever stack fits their hosting (Node/Express, Python/FastAPI, PHP, etc.) and deploys it separately from the GoDaddy frontend if shared hosting limits apply. **AWS App Runner** is a straightforward option for a small containerized API; reuse `scripts/export-service.ts` directly if the backend is Node/TypeScript.
+
 ### Suggested API surface
 
 ```
@@ -160,11 +164,39 @@ On failure, fetch the WorkItem `reportUrl` for detailed Fusion worker logs.
 
 ### Export behavior
 
-- Walks the assembly component tree
-- Exports each component as a STEP file
-- Multi-body components are split into one STEP per body
-- Also exports a full-assembly STEP file
-- Packs all STEP files into `exports.zip` and uploads to OSS via the `OutputZip` parameter
+The worker walks the assembly tree and exports STEP files in this order (assembly and component exports run **before** body splitting mutates the design):
+
+1. **Full assembly** — one STEP for the whole design when it contains more than one body
+2. **Sub-assemblies** — named components that have child occurrences
+3. **Whole parts** — named leaf components (own bodies, no children), exported as one STEP with all bodies
+4. **Body splits** — only from **multi-body** parts; identical geometry across the assembly is deduplicated into one file per unique body shape
+
+**Naming**
+
+| Export type | Filename pattern |
+|-------------|------------------|
+| Assembly, sub-assembly, whole part | Plain part number (e.g. `112801975.step`) |
+| Body export (multi-body part only) | `{partNumber}_1`, `_2`, … |
+| Unlabeled bodies in a flat assembly | `part_1`, `part_2`, … |
+
+**Deduplication**
+
+- **By part number** — if multiple components share the same name, export one STEP file; `parts-manifest.json` lists every placement and `quantity` counts **component instances**, not bodies within a part
+- **By geometry** — rotated copies of the same body shape export once; `quantity` on body-level entries counts matching body instances across the assembly
+- **Mirrors** — mirrored variants stay as separate files and are linked via optional `mirrors` in the manifest (shape match + opposite inertia handedness; steel is applied temporarily for comparison, then restored before export)
+
+**Manifest**
+
+`parts-manifest.json` lists each exported STEP (excluding the full-assembly file) with:
+
+| Field | Meaning |
+|-------|---------|
+| `part` | Output filename |
+| `quantity` | Instance count (component placements for whole parts; body instances for body splits) |
+| `locations` | Assembly paths for each instance |
+| `mirrors` | Optional list of mirror-variant filenames |
+
+Also packs all STEP files plus the manifest into `exports.zip` and uploads to OSS via the `OutputZip` parameter.
 
 **STEP vs F3D:** STEP imports open in Direct Modeling mode inside Fusion. Multi-body splitting uses body copy instead of cut/paste. Native `.f3d` files preserve full parametric behavior.
 
