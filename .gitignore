@@ -3,3 +3,4 @@ node_modules/
 .aps-token.json
 output/
 *.zip
+dist/

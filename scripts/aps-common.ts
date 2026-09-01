@@ -17,7 +17,12 @@ import {
     resolveSetting,
 } from "./cli-args";
 
-const ROOT = resolve(import.meta.dirname, "..");
+const ROOT = resolve(
+    typeof import.meta.dirname === "string"
+        ? import.meta.dirname
+        : process.env.LAMBDA_TASK_ROOT ?? process.cwd(),
+    typeof import.meta.dirname === "string" ? ".." : "."
+);
 const TOKEN_CACHE_PATH = resolve(ROOT, ".aps-token.json");
 
 /** Refresh 2-legged tokens this many ms before APS expiry. */
@@ -109,10 +114,10 @@ export const APS_SCOPES =
     "code:all data:read data:write data:create bucket:read bucket:create bucket:update";
 
 /** OSS multipart upload chunk size (APS direct-to-S3). */
-const OSS_UPLOAD_PART_SIZE = 5 * 1024 * 1024;
+export const OSS_UPLOAD_PART_SIZE = 5 * 1024 * 1024;
 
 /** APS allows up to 25 signed upload URLs per request. */
-const OSS_MAX_UPLOAD_PARTS_PER_REQUEST = 25;
+export const OSS_MAX_UPLOAD_PARTS_PER_REQUEST = 25;
 
 /** Use parallel range downloads above this size. */
 const OSS_PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024;
@@ -544,6 +549,97 @@ export async function getSignedOssDownload(
     }
 
     return signed;
+}
+
+export async function createSignedOssUpload(
+    token: string,
+    bucketKey: string,
+    objectKey: string,
+    options: {
+        parts: number;
+        firstPart?: number;
+        uploadKey?: string;
+        minutesExpiration?: number;
+    }
+): Promise<{ uploadKey: string; urls: string[] }> {
+    const firstPart = options.firstPart ?? 1;
+    const minutesExpiration = options.minutesExpiration ?? 15;
+
+    let signedUrl =
+        "https://developer.api.autodesk.com/oss/v2/buckets/" +
+        `${encodeURIComponent(bucketKey)}/objects/` +
+        `${encodeURIComponent(objectKey)}/signeds3upload` +
+        `?parts=${options.parts}` +
+        `&firstPart=${firstPart}` +
+        `&minutesExpiration=${minutesExpiration}`;
+
+    if (options.uploadKey) {
+        signedUrl +=
+            `&uploadKey=${encodeURIComponent(options.uploadKey)}`;
+    }
+
+    const signedUrlResponse = await fetch(signedUrl, {
+        headers: {
+            Authorization: `Bearer ${token}`,
+        },
+    });
+
+    const signedText = await signedUrlResponse.text();
+
+    if (!signedUrlResponse.ok) {
+        throw new Error(
+            `Failed to get signed OSS upload URL for ${objectKey}: ` +
+                `${signedUrlResponse.status}\n${signedText}`
+        );
+    }
+
+    const signed = JSON.parse(signedText) as {
+        uploadKey?: string;
+        urls?: string[];
+    };
+
+    if (!signed.uploadKey || !signed.urls || signed.urls.length === 0) {
+        throw new Error(
+            `OSS did not return upload URLs for ${objectKey}`
+        );
+    }
+
+    return {
+        uploadKey: signed.uploadKey,
+        urls: signed.urls,
+    };
+}
+
+export async function completeSignedOssUpload(
+    token: string,
+    bucketKey: string,
+    objectKey: string,
+    uploadKey: string
+): Promise<void> {
+    const completeResponse = await fetch(
+        "https://developer.api.autodesk.com/oss/v2/buckets/" +
+            `${encodeURIComponent(bucketKey)}/objects/` +
+            `${encodeURIComponent(objectKey)}/signeds3upload`,
+        {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                uploadKey,
+            }),
+        }
+    );
+
+    const completeText = await completeResponse.text();
+
+    if (!completeResponse.ok) {
+        throw new Error(
+            `Failed to finalize OSS upload for ${objectKey}: ` +
+                `${completeResponse.status}\n${completeText}`
+        );
+    }
 }
 
 async function fetchOssByteRange(
