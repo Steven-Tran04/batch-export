@@ -98,6 +98,10 @@ GET    /api/export/:jobId       Poll status → { status, error? }
 GET    /api/export/:jobId/download   Stream or redirect to zip (only when status = success)
 ```
 
+For downloads, **redirect the browser to the OSS signed URL** (`getExportDownloadUrl()` in `scripts/export-service.ts`) instead of downloading the zip to your server and re-serving it. That removes a full network hop and is usually the biggest OSS speed win.
+
+Uploads and CLI downloads use parallel direct-to-S3 transfers in `scripts/aps-common.ts` (up to 25 upload parts and 6 concurrent download ranges for large files).
+
 For large files (50 MB+), consider a two-step flow: backend returns OSS signed upload URLs, browser uploads directly to OSS, then backend submits the WorkItem with the object key only.
 
 ### WorkItem payload (STEP upload)
@@ -183,7 +187,8 @@ The worker walks the assembly tree and exports STEP files in this order (assembl
 
 - **By part number** — if multiple components share the same name, export one STEP file; `parts-manifest.json` lists every placement and `quantity` counts **component instances**, not bodies within a part
 - **By geometry** — rotated copies of the same body shape export once; `quantity` on body-level entries counts matching body instances across the assembly
-- **Mirrors** — mirrored variants stay as separate files and are linked via optional `mirrors` in the manifest (shape match + opposite inertia handedness; steel is applied temporarily for comparison, then restored before export)
+- **Surface bodies** — sheets have no mass, so they are matched by area, oriented-box extents, face/edge counts, face layout around the area centroid, and edge lengths. Mirror detection uses area inertia instead of mass inertia; degenerate (planar or symmetric) sheets are treated as the same family rather than as mirrors
+- **Mirrors** — mirrored variants stay as separate files and are linked via optional `mirrors` in the manifest (shape match + opposite inertia handedness; steel is applied temporarily to **solid** bodies for comparison, then restored before export)
 
 **Manifest**
 
@@ -196,7 +201,19 @@ The worker walks the assembly tree and exports STEP files in this order (assembl
 | `locations` | Assembly paths for each instance |
 | `mirrors` | Optional list of mirror-variant filenames |
 
-Also packs all STEP files plus the manifest into `exports.zip` and uploads to OSS via the `OutputZip` parameter.
+**Bounding boxes**
+
+`bounding-boxes.json` lists a tight oriented bounding box for each **leaf** STEP only (named parts and split bodies from multi-body parts). Full-assembly and sub-assembly files are omitted.
+
+| Field | Meaning |
+|-------|---------|
+| `unit` | Always `cm` (Fusion internal length unit) |
+| `parts[].part` | Output filename, joinable with `parts-manifest.json` |
+| `parts[].length` | Oriented box length (cm) |
+| `parts[].width` | Oriented box width (cm) |
+| `parts[].height` | Oriented box height (cm) |
+
+Also packs all STEP files plus `parts-manifest.json` and `bounding-boxes.json` into `exports.zip` and uploads to OSS via the `OutputZip` parameter.
 
 **STEP vs F3D:** STEP imports open in Direct Modeling mode inside Fusion. Multi-body splitting uses body copy instead of cut/paste. Native `.f3d` files preserve full parametric behavior.
 
@@ -258,7 +275,7 @@ npm run export
 
 | Phase | Typical duration |
 |-------|------------------|
-| OSS upload/download | Seconds |
+| OSS upload/download | Seconds (parallel direct-to-S3 transfers) |
 | STEP import (large assembly) | Several minutes |
 | Export + zip | Seconds to minutes |
 | WorkItem timeout | **900 seconds** (15 min) |

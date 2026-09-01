@@ -1,9 +1,12 @@
 import "dotenv/config";
 
 import {
+    closeSync,
     existsSync,
+    openSync,
     readFileSync,
     writeFileSync,
+    writeSync,
 } from "node:fs";
 import { extname } from "node:path";
 import { resolve } from "node:path";
@@ -16,6 +19,17 @@ import {
 
 const ROOT = resolve(import.meta.dirname, "..");
 const TOKEN_CACHE_PATH = resolve(ROOT, ".aps-token.json");
+
+/** Refresh 2-legged tokens this many ms before APS expiry. */
+const TWO_LEGGED_EXPIRY_SKEW_MS = 60_000;
+
+interface TwoLeggedTokenCache {
+    access_token: string;
+    expires_at: number;
+}
+
+let twoLeggedTokenCache: TwoLeggedTokenCache | null = null;
+let twoLeggedTokenInFlight: Promise<string> | null = null;
 
 export const APS_CLIENT_ID = process.env.APS_CLIENT_ID;
 export const APS_CLIENT_SECRET = process.env.APS_CLIENT_SECRET;
@@ -94,6 +108,28 @@ export function getQualifiedAppBundleId(): string {
 export const APS_SCOPES =
     "code:all data:read data:write data:create bucket:read bucket:create bucket:update";
 
+/** OSS multipart upload chunk size (APS direct-to-S3). */
+const OSS_UPLOAD_PART_SIZE = 5 * 1024 * 1024;
+
+/** APS allows up to 25 signed upload URLs per request. */
+const OSS_MAX_UPLOAD_PARTS_PER_REQUEST = 25;
+
+/** Use parallel range downloads above this size. */
+const OSS_PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024;
+
+/** Byte range size for parallel OSS downloads. */
+const OSS_DOWNLOAD_PART_SIZE = 8 * 1024 * 1024;
+
+/** Concurrent range requests when downloading large objects. */
+const OSS_DOWNLOAD_CONCURRENCY = 6;
+
+export interface SignedOssDownload {
+    status?: string;
+    url?: string;
+    urls?: Record<string, string>;
+    size?: number;
+}
+
 /**
  * Scopes for browser sign-in (3-legged OAuth). Must be valid APS scope names
  * enabled on your app (typically Data Management API). Do not include
@@ -160,6 +196,9 @@ export function saveTokenCache(cache: TokenCache): void {
 }
 
 export function clearTokenCache(): void {
+    twoLeggedTokenCache = null;
+    twoLeggedTokenInFlight = null;
+
     if (existsSync(TOKEN_CACHE_PATH)) {
         writeFileSync(TOKEN_CACHE_PATH, "{}", "utf8");
     }
@@ -351,7 +390,11 @@ export function resolveWorkItemTarget(
     };
 }
 
-export async function getTwoLeggedToken(): Promise<string> {
+function isTwoLeggedTokenFresh(expiresAt: number): boolean {
+    return expiresAt > Date.now() + TWO_LEGGED_EXPIRY_SKEW_MS;
+}
+
+async function requestTwoLeggedToken(): Promise<string> {
     requireApsCredentials();
 
     const credentials = Buffer.from(
@@ -380,8 +423,45 @@ export async function getTwoLeggedToken(): Promise<string> {
         );
     }
 
-    const data = await response.json();
-    return data.access_token as string;
+    const data = (await response.json()) as {
+        access_token?: string;
+        expires_in?: number;
+    };
+
+    if (!data.access_token) {
+        throw new Error("APS did not return a 2-legged access_token.");
+    }
+
+    const expiresInSeconds =
+        typeof data.expires_in === "number" && data.expires_in > 0
+            ? data.expires_in
+            : 3600;
+
+    twoLeggedTokenCache = {
+        access_token: data.access_token,
+        expires_at: Date.now() + expiresInSeconds * 1000,
+    };
+
+    return data.access_token;
+}
+
+export async function getTwoLeggedToken(): Promise<string> {
+    if (
+        twoLeggedTokenCache &&
+        isTwoLeggedTokenFresh(twoLeggedTokenCache.expires_at)
+    ) {
+        return twoLeggedTokenCache.access_token;
+    }
+
+    if (twoLeggedTokenInFlight) {
+        return twoLeggedTokenInFlight;
+    }
+
+    twoLeggedTokenInFlight = requestTwoLeggedToken().finally(() => {
+        twoLeggedTokenInFlight = null;
+    });
+
+    return twoLeggedTokenInFlight;
 }
 
 export async function ensureBucket(
@@ -424,6 +504,257 @@ export async function ensureBucket(
     }
 }
 
+export async function getSignedOssDownload(
+    token: string,
+    bucketKey: string,
+    objectKey: string,
+    minutesExpiration = 15
+): Promise<SignedOssDownload> {
+    const signedUrlResponse = await fetch(
+        "https://developer.api.autodesk.com/oss/v2/buckets/" +
+            `${encodeURIComponent(bucketKey)}/objects/` +
+            `${encodeURIComponent(objectKey)}/signeds3download` +
+            `?minutesExpiration=${minutesExpiration}`,
+        {
+            headers: {
+                Authorization: `Bearer ${token}`,
+            },
+        }
+    );
+
+    const signedText = await signedUrlResponse.text();
+
+    if (!signedUrlResponse.ok) {
+        throw new Error(
+            `Failed to get signed OSS download URL for ${objectKey}: ` +
+                `${signedUrlResponse.status}\n${signedText}`
+        );
+    }
+
+    const signed = JSON.parse(signedText) as SignedOssDownload;
+
+    if (
+        !signed.url &&
+        (!signed.urls || Object.keys(signed.urls).length === 0)
+    ) {
+        throw new Error(
+            `OSS did not return a signed download URL for ${objectKey} ` +
+                `(status: ${signed.status ?? "unknown"})`
+        );
+    }
+
+    return signed;
+}
+
+async function fetchOssByteRange(
+    url: string,
+    start: number,
+    end: number
+): Promise<Buffer> {
+    const response = await fetch(url, {
+        headers: {
+            Range: `bytes=${start}-${end}`,
+        },
+    });
+
+    if (response.status !== 206 && response.status !== 200) {
+        const text = await response.text();
+        throw new Error(
+            `Failed to download OSS byte range ${start}-${end}: ` +
+                `${response.status}\n${text}`
+        );
+    }
+
+    return Buffer.from(await response.arrayBuffer());
+}
+
+async function runWithConcurrency<T>(
+    tasks: Array<() => Promise<T>>,
+    concurrency: number
+): Promise<T[]> {
+    const results: T[] = new Array(tasks.length);
+    let nextIndex = 0;
+
+    async function worker(): Promise<void> {
+        while (true) {
+            const index = nextIndex;
+            nextIndex += 1;
+
+            if (index >= tasks.length) {
+                return;
+            }
+
+            results[index] = await tasks[index]();
+        }
+    }
+
+    const workerCount = Math.min(
+        concurrency,
+        Math.max(1, tasks.length)
+    );
+
+    await Promise.all(
+        Array.from({ length: workerCount }, () => worker())
+    );
+
+    return results;
+}
+
+async function downloadSignedUrlToPath(
+    signed: SignedOssDownload,
+    destinationPath: string
+): Promise<void> {
+    if (
+        signed.status === "chunked" &&
+        signed.urls &&
+        Object.keys(signed.urls).length > 0
+    ) {
+        const chunks = await Promise.all(
+            Object.entries(signed.urls).map(async ([range, url]) => {
+                const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+
+                if (!match) {
+                    throw new Error(
+                        `Unexpected OSS chunked download range: ${range}`
+                    );
+                }
+
+                const start = Number(match[1]);
+                const end = Number(match[2]);
+
+                return {
+                    start,
+                    bytes: await fetchOssByteRange(url, start, end),
+                };
+            })
+        );
+
+        chunks.sort((left, right) => left.start - right.start);
+
+        const totalSize = signed.size ??
+            chunks.reduce(
+                (sum, chunk) => sum + chunk.bytes.length,
+                0
+            );
+
+        const fileHandle = openSync(destinationPath, "w");
+
+        try {
+            let offset = 0;
+
+            for (const chunk of chunks) {
+                writeSync(
+                    fileHandle,
+                    chunk.bytes,
+                    0,
+                    chunk.bytes.length,
+                    offset
+                );
+                offset += chunk.bytes.length;
+            }
+
+            if (signed.size && offset !== totalSize) {
+                throw new Error(
+                    `OSS chunked download size mismatch: ` +
+                    `expected ${totalSize}, got ${offset}`
+                );
+            }
+        } finally {
+            closeSync(fileHandle);
+        }
+
+        return;
+    }
+
+    const downloadUrl = signed.url;
+
+    if (!downloadUrl) {
+        throw new Error(
+            "OSS signed download response did not include a URL."
+        );
+    }
+
+    const objectSize = signed.size;
+
+    if (
+        !objectSize ||
+        objectSize < OSS_PARALLEL_DOWNLOAD_THRESHOLD
+    ) {
+        const response = await fetch(downloadUrl);
+
+        if (!response.ok) {
+            const text = await response.text();
+            throw new Error(
+                `Failed to download OSS object from signed URL: ` +
+                    `${response.status}\n${text}`
+            );
+        }
+
+        writeFileSync(
+            destinationPath,
+            Buffer.from(await response.arrayBuffer())
+        );
+
+        return;
+    }
+
+    const partCount = Math.ceil(
+        objectSize / OSS_DOWNLOAD_PART_SIZE
+    );
+    const tasks = Array.from(
+        { length: partCount },
+        (_, index) => {
+            const start = index * OSS_DOWNLOAD_PART_SIZE;
+            const end = Math.min(
+                start + OSS_DOWNLOAD_PART_SIZE - 1,
+                objectSize - 1
+            );
+
+            return async () => ({
+                start,
+                bytes: await fetchOssByteRange(
+                    downloadUrl,
+                    start,
+                    end
+                ),
+            });
+        }
+    );
+
+    const parts = await runWithConcurrency(
+        tasks,
+        OSS_DOWNLOAD_CONCURRENCY
+    );
+
+    parts.sort((left, right) => left.start - right.start);
+
+    const fileHandle = openSync(destinationPath, "w");
+
+    try {
+        let offset = 0;
+
+        for (const part of parts) {
+            writeSync(
+                fileHandle,
+                part.bytes,
+                0,
+                part.bytes.length,
+                offset
+            );
+            offset += part.bytes.length;
+        }
+
+        if (offset !== objectSize) {
+            throw new Error(
+                `OSS parallel download size mismatch: ` +
+                `expected ${objectSize}, got ${offset}`
+            );
+        }
+    } finally {
+        closeSync(fileHandle);
+    }
+}
+
 export async function uploadBucketObject(
     token: string,
     bucketKey: string,
@@ -431,87 +762,109 @@ export async function uploadBucketObject(
     sourcePath: string
 ): Promise<void> {
     const bytes = readFileSync(sourcePath);
-    const chunkSize = 5 * 1024 * 1024;
     const totalParts = Math.max(
         1,
-        Math.ceil(bytes.length / chunkSize)
+        Math.ceil(bytes.length / OSS_UPLOAD_PART_SIZE)
     );
 
     let partsUploaded = 0;
     let uploadKey: string | undefined;
-    let uploadUrls: string[] = [];
+    let pendingUploadUrls: string[] = [];
 
-    while (partsUploaded < totalParts) {
-        const start = partsUploaded * chunkSize;
-        const end = Math.min(start + chunkSize, bytes.length);
-        const chunk = bytes.subarray(start, end);
+    async function refreshUploadUrls(
+        partCount: number
+    ): Promise<void> {
+        let signedUrl =
+            "https://developer.api.autodesk.com/oss/v2/buckets/" +
+            `${encodeURIComponent(bucketKey)}/objects/` +
+            `${encodeURIComponent(objectKey)}/signeds3upload` +
+            `?parts=${partCount}` +
+            `&firstPart=${partsUploaded + 1}` +
+            "&minutesExpiration=15";
 
-        if (uploadUrls.length === 0) {
-            let signedUrl =
-                "https://developer.api.autodesk.com/oss/v2/buckets/" +
-                `${encodeURIComponent(bucketKey)}/objects/` +
-                `${encodeURIComponent(objectKey)}/signeds3upload` +
-                `?parts=1&firstPart=${partsUploaded + 1}` +
-                "&minutesExpiration=15";
-
-            if (uploadKey) {
-                signedUrl +=
-                    `&uploadKey=${encodeURIComponent(uploadKey)}`;
-            }
-
-            const signedUrlResponse = await fetch(signedUrl, {
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                },
-            });
-
-            const signedText = await signedUrlResponse.text();
-
-            if (!signedUrlResponse.ok) {
-                throw new Error(
-                    `Failed to get signed OSS upload URL for ${objectKey}: ` +
-                        `${signedUrlResponse.status}\n${signedText}`
-                );
-            }
-
-            const signed = JSON.parse(signedText) as {
-                uploadKey?: string;
-                urls?: string[];
-            };
-
-            uploadKey = signed.uploadKey;
-            uploadUrls = signed.urls ?? [];
-
-            if (!uploadKey || uploadUrls.length === 0) {
-                throw new Error(
-                    `OSS did not return upload URLs for ${objectKey}`
-                );
-            }
+        if (uploadKey) {
+            signedUrl +=
+                `&uploadKey=${encodeURIComponent(uploadKey)}`;
         }
 
-        const uploadUrl = uploadUrls.shift();
-
-        if (!uploadUrl) {
-            throw new Error(
-                `OSS upload URLs exhausted before part ` +
-                    `${partsUploaded + 1} of ${totalParts}`
-            );
-        }
-
-        const uploadResponse = await fetch(uploadUrl, {
-            method: "PUT",
-            body: chunk,
+        const signedUrlResponse = await fetch(signedUrl, {
+            headers: {
+                Authorization: `Bearer ${token}`,
+            },
         });
 
-        if (!uploadResponse.ok) {
-            const text = await uploadResponse.text();
+        const signedText = await signedUrlResponse.text();
+
+        if (!signedUrlResponse.ok) {
             throw new Error(
-                `Failed to upload OSS object part for ${objectKey}: ` +
-                    `${uploadResponse.status}\n${text}`
+                `Failed to get signed OSS upload URL for ${objectKey}: ` +
+                    `${signedUrlResponse.status}\n${signedText}`
             );
         }
 
-        partsUploaded += 1;
+        const signed = JSON.parse(signedText) as {
+            uploadKey?: string;
+            urls?: string[];
+        };
+
+        uploadKey = signed.uploadKey;
+        pendingUploadUrls = signed.urls ?? [];
+
+        if (!uploadKey || pendingUploadUrls.length === 0) {
+            throw new Error(
+                `OSS did not return upload URLs for ${objectKey}`
+            );
+        }
+    }
+
+    while (partsUploaded < totalParts) {
+        if (pendingUploadUrls.length === 0) {
+            const remainingParts = totalParts - partsUploaded;
+            const batchSize = Math.min(
+                OSS_MAX_UPLOAD_PARTS_PER_REQUEST,
+                remainingParts
+            );
+
+            await refreshUploadUrls(batchSize);
+        }
+
+        const batchTasks: Array<() => Promise<number>> = [];
+
+        while (
+            pendingUploadUrls.length > 0 &&
+            batchTasks.length < OSS_MAX_UPLOAD_PARTS_PER_REQUEST &&
+            partsUploaded + batchTasks.length < totalParts
+        ) {
+            const uploadUrl = pendingUploadUrls.shift()!;
+
+            const partIndex = partsUploaded + batchTasks.length;
+            const start = partIndex * OSS_UPLOAD_PART_SIZE;
+            const end = Math.min(
+                start + OSS_UPLOAD_PART_SIZE,
+                bytes.length
+            );
+            const chunk = bytes.subarray(start, end);
+
+            batchTasks.push(async () => {
+                const uploadResponse = await fetch(uploadUrl, {
+                    method: "PUT",
+                    body: chunk,
+                });
+
+                if (!uploadResponse.ok) {
+                    const text = await uploadResponse.text();
+                    throw new Error(
+                        `Failed to upload OSS object part for ${objectKey}: ` +
+                            `${uploadResponse.status}\n${text}`
+                    );
+                }
+
+                return chunk.length;
+            });
+        }
+
+        await Promise.all(batchTasks.map((task) => task()));
+        partsUploaded += batchTasks.length;
     }
 
     const completeResponse = await fetch(
@@ -546,51 +899,13 @@ export async function downloadBucketObject(
     objectKey: string,
     destinationPath: string
 ): Promise<void> {
-    const signedUrlResponse = await fetch(
-        "https://developer.api.autodesk.com/oss/v2/buckets/" +
-            `${encodeURIComponent(bucketKey)}/objects/` +
-            `${encodeURIComponent(objectKey)}/signeds3download` +
-            "?minutesExpiration=15",
-        {
-            headers: {
-                Authorization: `Bearer ${token}`,
-            },
-        }
+    const signed = await getSignedOssDownload(
+        token,
+        bucketKey,
+        objectKey
     );
 
-    const signedText = await signedUrlResponse.text();
-
-    if (!signedUrlResponse.ok) {
-        throw new Error(
-            `Failed to get signed OSS download URL for ${objectKey}: ` +
-                `${signedUrlResponse.status}\n${signedText}`
-        );
-    }
-
-    const signed = JSON.parse(signedText) as {
-        status?: string;
-        url?: string;
-    };
-
-    if (!signed.url) {
-        throw new Error(
-            `OSS did not return a signed download URL for ${objectKey} ` +
-                `(status: ${signed.status ?? "unknown"})`
-        );
-    }
-
-    const response = await fetch(signed.url);
-
-    if (!response.ok) {
-        const text = await response.text();
-        throw new Error(
-            `Failed to download OSS object ${objectKey} from signed URL: ` +
-                `${response.status}\n${text}`
-        );
-    }
-
-    const bytes = Buffer.from(await response.arrayBuffer());
-    writeFileSync(destinationPath, bytes);
+    await downloadSignedUrlToPath(signed, destinationPath);
 }
 
 /**

@@ -29,7 +29,8 @@
  * 5. Finds the components/bodies to export
  * 6. Exports each component as STEP
  * 7. Optionally exports the full assembly as STEP
- * 8. Reports the generated file paths through adsk.result
+ * 8. Writes leaf oriented bounding boxes to bounding-boxes.json
+ * 9. Reports the generated file paths through adsk.result
  *
  * IMPORTANT:
  *
@@ -130,6 +131,13 @@ interface PartExportPlan {
 }
 
 
+interface OrientedBoxDimensions {
+  length: number;
+  width: number;
+  height: number;
+}
+
+
 interface ComponentEntry {
   componentName: string;
   outputFile: string;
@@ -137,6 +145,7 @@ interface ComponentEntry {
   fingerprint?: string;
   instanceCount?: number;
   matchedBodyNames?: string[];
+  boundingBox?: OrientedBoxDimensions;
 }
 
 
@@ -169,6 +178,20 @@ interface PartsManifestEntry {
   quantity: number;
   locations: string[];
   mirrors?: string[];
+}
+
+
+interface BoundingBoxEntry {
+  part: string;
+  length: number;
+  width: number;
+  height: number;
+}
+
+
+interface BoundingBoxesDocument {
+  unit: "cm";
+  parts: BoundingBoxEntry[];
 }
 
 
@@ -330,7 +353,7 @@ interface ReferencePoint {
   x: number;
   y: number;
   z: number;
-  source: "center-of-mass" | "bbox-center";
+  source: "center-of-mass" | "area-centroid" | "bbox-center";
 }
 
 
@@ -354,25 +377,32 @@ interface InertiaTensorAtCom {
  * Minimal geometry metrics for duplicate and mirror detection.
  */
 interface BodyMetrics {
+  isSolid: boolean;
   volume: number;
   area: number;
+  faceCount: number;
+  edgeCount: number;
+  /** Sorted oriented-box extents; used for surface-body bucketing. */
+  obbExtents?: [number, number, number];
+  /** Sorted edge lengths; extra shape signal for surface bodies. */
+  edgeLengths: number[];
   referencePoint: ReferencePoint;
   /** Sorted by area then distance — invariant under rotation. */
   faceLayout: FaceLayoutEntry[];
-  /** Sorted principal moments (kg·cm²) — no chirality alone. */
+  /** Sorted principal moments (kg·cm² or area-moment analogue). */
   principalMoments: [number, number, number];
-  /** Mass from physical properties (kg). */
+  /** Mass from physical properties (kg). Zero for surface bodies. */
   mass: number;
-  /** Full inertia tensor at COM in the body/component frame. */
+  /** Full inertia tensor at the reference point. */
   inertiaAtCom: InertiaTensorAtCom;
-  /** sign(Ixy)·sign(Iyz)·sign(Ixz) at COM in the shared frame. */
+  /** sign(Ixy)·sign(Iyz)·sign(Ixz) at the reference point. */
   inertiaProductParity: number;
   /**
    * Triple product of principal axes after pinning each axis toward the
-   * largest face centroid from COM.
+   * largest face centroid from the reference point.
    */
   pinnedAxisHandedness: number;
-  /** Mass and principal moments were read successfully from the API. */
+  /** Moments were read successfully (mass COM or area inertia). */
   inertiaValid: boolean;
   /** Pinned axis handedness is usable for mirror vs rotation decisions. */
   inertiaReliable: boolean;
@@ -392,6 +422,7 @@ const BULK_METRIC_ABS_TOLERANCE = 1e-7;
 const LOCAL_METRIC_REL_TOLERANCE = 2e-4;
 const LOCAL_METRIC_ABS_TOLERANCE = 1e-6;
 const INERTIA_MIN_VALID_MASS = 1e-6;
+const INERTIA_MIN_VALID_AREA = 1e-6;
 const INERTIA_MIN_PRINCIPAL_MOMENT = 1e-9;
 const INERTIA_MIN_AXIS_HANDEDNESS = 0.5;
 const INERTIA_MIN_MOMENT_SPREAD = 0.01;
@@ -476,6 +507,691 @@ function collectBboxCenter(
       source: "bbox-center",
     };
   }
+}
+
+
+interface WeightedSample {
+  point: Vector3;
+  weight: number;
+}
+
+
+function bodyIsSolid(
+  body: adsk.fusion.BRepBody
+): boolean {
+  try {
+    return body.isSolid;
+  } catch {
+    return true;
+  }
+}
+
+
+function collectionCount(
+  collection: { count: number } | null | undefined
+): number {
+  try {
+    return collection?.count ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+
+function sortThree(
+  first: number,
+  second: number,
+  third: number
+): [number, number, number] {
+  return [first, second, third].sort(
+    (left, right) => left - right
+  ) as [number, number, number];
+}
+
+
+function emptyInertiaTensor(): InertiaTensorAtCom {
+  return {
+    ixx: 0,
+    iyy: 0,
+    izz: 0,
+    ixy: 0,
+    iyz: 0,
+    ixz: 0,
+  };
+}
+
+
+function collectBodyTopology(
+  body: adsk.fusion.BRepBody
+): {
+  faceCount: number;
+  edgeCount: number;
+} {
+  return {
+    faceCount: collectionCount(body.faces),
+    edgeCount: collectionCount(body.edges),
+  };
+}
+
+
+function collectEdgeLengths(
+  body: adsk.fusion.BRepBody
+): number[] {
+  const lengths: number[] = [];
+
+  try {
+    const edgeCount = body.edges.count;
+
+    for (let i = 0; i < edgeCount; i++) {
+      try {
+        const length = body.edges.item(i).length;
+
+        if (Number.isFinite(length)) {
+          lengths.push(length);
+        }
+      } catch {
+        continue;
+      }
+    }
+  } catch {
+    return lengths;
+  }
+
+  lengths.sort((left, right) => left - right);
+
+  return lengths;
+}
+
+
+/**
+ * Sorted oriented-box extents. Returns undefined when the OBB is
+ * unavailable — AABB extents are orientation-dependent and must not
+ * be used as a bucket key.
+ */
+function collectObbExtents(
+  body: adsk.fusion.BRepBody
+): [number, number, number] | undefined {
+  try {
+    const box = body.orientedMinimumBoundingBox;
+    const extents = sortThree(
+      box.length,
+      box.width,
+      box.height
+    );
+
+    if (!extents.every(Number.isFinite)) {
+      return undefined;
+    }
+
+    return extents;
+  } catch {
+    return undefined;
+  }
+}
+
+
+function collectAreaCentroid(
+  body: adsk.fusion.BRepBody
+): ReferencePoint | null {
+  let totalArea = 0;
+  let x = 0;
+  let y = 0;
+  let z = 0;
+
+  try {
+    const faceCount = body.faces.count;
+
+    for (let i = 0; i < faceCount; i++) {
+      const face = body.faces.item(i);
+      const area = face.area;
+      const centroid = face.centroid;
+
+      if (
+        !Number.isFinite(area) ||
+        area <= 0
+      ) {
+        continue;
+      }
+
+      totalArea += area;
+      x += area * centroid.x;
+      y += area * centroid.y;
+      z += area * centroid.z;
+    }
+  } catch {
+    return null;
+  }
+
+  if (totalArea <= INERTIA_MIN_VALID_AREA) {
+    return null;
+  }
+
+  return {
+    x: x / totalArea,
+    y: y / totalArea,
+    z: z / totalArea,
+    source: "area-centroid",
+  };
+}
+
+
+function triangleAreaAndCentroid(
+  first: Vector3,
+  second: Vector3,
+  third: Vector3
+): {
+  area: number;
+  centroid: Vector3;
+} | null {
+  const ab = {
+    x: second.x - first.x,
+    y: second.y - first.y,
+    z: second.z - first.z,
+  };
+  const ac = {
+    x: third.x - first.x,
+    y: third.y - first.y,
+    z: third.z - first.z,
+  };
+  const cross = {
+    x: ab.y * ac.z - ab.z * ac.y,
+    y: ab.z * ac.x - ab.x * ac.z,
+    z: ab.x * ac.y - ab.y * ac.x,
+  };
+  const area =
+    0.5 * vectorLength(cross);
+
+  if (
+    !Number.isFinite(area) ||
+    area <= BULK_METRIC_ABS_TOLERANCE
+  ) {
+    return null;
+  }
+
+  return {
+    area,
+    centroid: {
+      x: (first.x + second.x + third.x) / 3,
+      y: (first.y + second.y + third.y) / 3,
+      z: (first.z + second.z + third.z) / 3,
+    },
+  };
+}
+
+
+function pointFromCoordinateList(
+  coordinates: unknown,
+  index: number
+): Vector3 | null {
+  if (Array.isArray(coordinates)) {
+    const entry = coordinates[index];
+    const fromObject = asVector3(entry);
+
+    if (fromObject) {
+      return fromObject;
+    }
+
+    const offset = index * 3;
+
+    if (
+      typeof coordinates[offset] === "number" &&
+      typeof coordinates[offset + 1] === "number" &&
+      typeof coordinates[offset + 2] === "number"
+    ) {
+      return {
+        x: Number(coordinates[offset]),
+        y: Number(coordinates[offset + 1]),
+        z: Number(coordinates[offset + 2]),
+      };
+    }
+  }
+
+  return null;
+}
+
+
+function asNumberList(
+  value: unknown
+): number[] | null {
+  if (!value) {
+    return null;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(Number);
+  }
+
+  if (ArrayBuffer.isView(value)) {
+    return Array.from(
+      value as ArrayLike<number>
+    );
+  }
+
+  if (
+    typeof value === "object" &&
+    "length" in value &&
+    typeof (value as { length: number }).length ===
+      "number"
+  ) {
+    return Array.from(
+      value as ArrayLike<unknown>
+    ).map(Number);
+  }
+
+  if (
+    typeof value === "object" &&
+    "count" in value &&
+    "item" in value
+  ) {
+    const collection = value as {
+      count: number;
+      item: (index: number) => unknown;
+    };
+    const list: number[] = [];
+
+    for (let i = 0; i < collection.count; i++) {
+      list.push(Number(collection.item(i)));
+    }
+
+    return list;
+  }
+
+  return null;
+}
+
+
+function pointAtCoordinate(
+  coordinates: unknown,
+  index: number
+): Vector3 | null {
+  const fromList = pointFromCoordinateList(
+    coordinates,
+    index
+  );
+
+  if (fromList) {
+    return fromList;
+  }
+
+  if (
+    coordinates &&
+    typeof coordinates === "object" &&
+    "item" in coordinates
+  ) {
+    try {
+      return asVector3(
+        (
+          coordinates as {
+            item: (i: number) => unknown;
+          }
+        ).item(index)
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+
+function collectTriangleMeshSamples(
+  body: adsk.fusion.BRepBody
+): WeightedSample[] {
+  const samples: WeightedSample[] = [];
+
+  try {
+    const calculator =
+      body.meshManager.createMeshCalculator();
+
+    const qualityOptions =
+      adsk.fusion as unknown as {
+        TriangleMeshQualityOptions?: {
+          NormalQualityTriangleMesh?: number;
+        };
+      };
+
+    const quality =
+      qualityOptions.TriangleMeshQualityOptions
+        ?.NormalQualityTriangleMesh;
+
+    if (
+      quality !== undefined &&
+      typeof calculator.setQuality === "function"
+    ) {
+      calculator.setQuality(quality);
+    }
+
+    const mesh = calculator.calculate();
+    const coordinates = mesh.nodeCoordinates;
+    const indices = asNumberList(mesh.nodeIndices);
+
+    if (!indices || indices.length < 3) {
+      return samples;
+    }
+
+    for (
+      let offset = 0;
+      offset + 2 < indices.length;
+      offset += 3
+    ) {
+      const first = pointAtCoordinate(
+        coordinates,
+        indices[offset]
+      );
+      const second = pointAtCoordinate(
+        coordinates,
+        indices[offset + 1]
+      );
+      const third = pointAtCoordinate(
+        coordinates,
+        indices[offset + 2]
+      );
+
+      if (!first || !second || !third) {
+        continue;
+      }
+
+      const triangle = triangleAreaAndCentroid(
+        first,
+        second,
+        third
+      );
+
+      if (!triangle) {
+        continue;
+      }
+
+      samples.push({
+        point: triangle.centroid,
+        weight: triangle.area,
+      });
+    }
+  } catch {
+    return [];
+  }
+
+  return samples;
+}
+
+
+function collectVertexSamples(
+  body: adsk.fusion.BRepBody
+): WeightedSample[] {
+  const samples: WeightedSample[] = [];
+
+  try {
+    const vertexCount = body.vertices.count;
+
+    for (let i = 0; i < vertexCount; i++) {
+      const geometry =
+        body.vertices.item(i).geometry;
+      const point = asVector3(geometry);
+
+      if (!point) {
+        continue;
+      }
+
+      samples.push({
+        point,
+        weight: 1,
+      });
+    }
+  } catch {
+    return samples;
+  }
+
+  return samples;
+}
+
+
+function collectFaceCentroidSamples(
+  body: adsk.fusion.BRepBody
+): WeightedSample[] {
+  const samples: WeightedSample[] = [];
+
+  try {
+    const faceCount = body.faces.count;
+
+    for (let i = 0; i < faceCount; i++) {
+      const face = body.faces.item(i);
+      const area = face.area;
+      const centroid = asVector3(face.centroid);
+
+      if (
+        !centroid ||
+        !Number.isFinite(area) ||
+        area <= 0
+      ) {
+        continue;
+      }
+
+      samples.push({
+        point: centroid,
+        weight: area,
+      });
+    }
+  } catch {
+    return samples;
+  }
+
+  return samples;
+}
+
+
+/**
+ * Discrete mass distribution for surface-body area inertia.
+ * Triangle mesh is preferred; vertices then face centroids are fallbacks.
+ */
+function collectSurfaceInertiaSamples(
+  body: adsk.fusion.BRepBody
+): WeightedSample[] {
+  const meshSamples =
+    collectTriangleMeshSamples(body);
+
+  if (meshSamples.length > 0) {
+    return meshSamples;
+  }
+
+  const vertexSamples =
+    collectVertexSamples(body);
+
+  if (vertexSamples.length > 0) {
+    return vertexSamples;
+  }
+
+  return collectFaceCentroidSamples(body);
+}
+
+
+function inertiaTensorFromSamples(
+  samples: WeightedSample[],
+  origin: Vector3
+): InertiaTensorAtCom {
+  const tensor = emptyInertiaTensor();
+
+  for (const sample of samples) {
+    const x = sample.point.x - origin.x;
+    const y = sample.point.y - origin.y;
+    const z = sample.point.z - origin.z;
+    const weight = sample.weight;
+
+    tensor.ixx += weight * (y * y + z * z);
+    tensor.iyy += weight * (x * x + z * z);
+    tensor.izz += weight * (x * x + y * y);
+    tensor.ixy -= weight * x * y;
+    tensor.iyz -= weight * y * z;
+    tensor.ixz -= weight * x * z;
+  }
+
+  return tensor;
+}
+
+
+function sampleWeightSum(
+  samples: WeightedSample[]
+): number {
+  return samples.reduce(
+    (total, sample) => total + sample.weight,
+    0
+  );
+}
+
+
+/**
+ * Jacobi eigensolver for a 3×3 symmetric inertia tensor.
+ */
+function eigenSymmetric3(
+  tensor: InertiaTensorAtCom
+): {
+  moments: [number, number, number];
+  axes: [Vector3, Vector3, Vector3];
+} | null {
+  const matrix = [
+    [tensor.ixx, tensor.ixy, tensor.ixz],
+    [tensor.ixy, tensor.iyy, tensor.iyz],
+    [tensor.ixz, tensor.iyz, tensor.izz],
+  ];
+  const vectors = [
+    [1, 0, 0],
+    [0, 1, 0],
+    [0, 0, 1],
+  ];
+
+  if (
+    ![
+      tensor.ixx,
+      tensor.iyy,
+      tensor.izz,
+      tensor.ixy,
+      tensor.iyz,
+      tensor.ixz,
+    ].every(Number.isFinite)
+  ) {
+    return null;
+  }
+
+  for (let iteration = 0; iteration < 50; iteration++) {
+    let p = 0;
+    let q = 1;
+    let maxOff = Math.abs(matrix[0][1]);
+
+    if (Math.abs(matrix[0][2]) > maxOff) {
+      p = 0;
+      q = 2;
+      maxOff = Math.abs(matrix[0][2]);
+    }
+
+    if (Math.abs(matrix[1][2]) > maxOff) {
+      p = 1;
+      q = 2;
+      maxOff = Math.abs(matrix[1][2]);
+    }
+
+    const scale =
+      Math.abs(matrix[0][0]) +
+      Math.abs(matrix[1][1]) +
+      Math.abs(matrix[2][2]);
+
+    if (
+      maxOff <=
+      1e-12 * Math.max(scale, 1)
+    ) {
+      break;
+    }
+
+    const app = matrix[p][p];
+    const aqq = matrix[q][q];
+    const apq = matrix[p][q];
+    const theta =
+      0.5 * Math.atan2(2 * apq, aqq - app);
+    const cosine = Math.cos(theta);
+    const sine = Math.sin(theta);
+
+    for (let row = 0; row < 3; row++) {
+      if (row === p || row === q) {
+        continue;
+      }
+
+      const arp = matrix[row][p];
+      const arq = matrix[row][q];
+
+      matrix[row][p] = matrix[p][row] =
+        cosine * arp - sine * arq;
+      matrix[row][q] = matrix[q][row] =
+        sine * arp + cosine * arq;
+    }
+
+    matrix[p][p] =
+      cosine * cosine * app -
+      2 * sine * cosine * apq +
+      sine * sine * aqq;
+    matrix[q][q] =
+      sine * sine * app +
+      2 * sine * cosine * apq +
+      cosine * cosine * aqq;
+    matrix[p][q] = matrix[q][p] = 0;
+
+    for (let row = 0; row < 3; row++) {
+      const vrp = vectors[row][p];
+      const vrq = vectors[row][q];
+
+      vectors[row][p] =
+        cosine * vrp - sine * vrq;
+      vectors[row][q] =
+        sine * vrp + cosine * vrq;
+    }
+  }
+
+  const unordered: Array<{
+    moment: number;
+    axis: Vector3;
+  }> = [0, 1, 2].map((index) => {
+    const axis = normalizeVector({
+      x: vectors[0][index],
+      y: vectors[1][index],
+      z: vectors[2][index],
+    });
+
+    return {
+      moment: matrix[index][index],
+      axis: axis ?? { x: 0, y: 0, z: 0 },
+    };
+  });
+
+  if (
+    unordered.some(
+      (entry) =>
+        !Number.isFinite(entry.moment) ||
+        vectorLength(entry.axis) <=
+          BULK_METRIC_ABS_TOLERANCE
+    )
+  ) {
+    return null;
+  }
+
+  unordered.sort(
+    (left, right) => left.moment - right.moment
+  );
+
+  const axes: [Vector3, Vector3, Vector3] = [
+    unordered[0].axis,
+    unordered[1].axis,
+    unordered[2].axis,
+  ];
+
+  if (scalarTripleProduct(...axes) < 0) {
+    axes[2] = negateVector(axes[2]);
+  }
+
+  return {
+    moments: [
+      unordered[0].moment,
+      unordered[1].moment,
+      unordered[2].moment,
+    ],
+    axes,
+  };
 }
 
 
@@ -754,6 +1470,18 @@ function applyTemporarySteelMaterials(
     }
 
     visited.add(token);
+
+    let isSolid = true;
+
+    try {
+      isSolid = ref.body.isSolid;
+    } catch {
+      isSolid = true;
+    }
+
+    if (!isSolid) {
+      continue;
+    }
 
     let originalMaterial:
       adsk.core.Material | null = null;
@@ -1058,9 +1786,21 @@ function computePinnedAxisHandedness(
   props: adsk.fusion.PhysicalProperties,
   com: Vector3
 ): number {
-  const axes = readPrincipalAxes(props);
+  return pinnedHandednessFromAxes(
+    body,
+    readPrincipalAxes(props),
+    com
+  );
+}
+
+
+function pinnedHandednessFromAxes(
+  body: adsk.fusion.BRepBody,
+  axes: [Vector3, Vector3, Vector3] | null,
+  origin: Vector3
+): number {
   const feature =
-    largestFaceFeatureVector(body, com);
+    largestFaceFeatureVector(body, origin);
 
   if (!axes || !feature) {
     return 0;
@@ -1178,7 +1918,10 @@ function evaluateInertiaMetrics(
   inertiaReliable: boolean;
   inertiaStatus: string;
 } {
-  if (referenceSource !== "center-of-mass") {
+  if (
+    referenceSource !== "center-of-mass" &&
+    referenceSource !== "area-centroid"
+  ) {
     return {
       inertiaValid: false,
       inertiaReliable: false,
@@ -1190,18 +1933,32 @@ function evaluateInertiaMetrics(
     return {
       inertiaValid: false,
       inertiaReliable: false,
-      inertiaStatus: "physical properties API read failed",
+      inertiaStatus:
+        referenceSource === "area-centroid"
+          ? "area inertia unavailable"
+          : "physical properties API read failed",
     };
   }
 
-  if (
+  if (referenceSource === "center-of-mass") {
+    if (
+      !Number.isFinite(mass) ||
+      mass <= INERTIA_MIN_VALID_MASS
+    ) {
+      return {
+        inertiaValid: false,
+        inertiaReliable: false,
+        inertiaStatus: `mass too small (${formatMetric(mass)} kg)`,
+      };
+    }
+  } else if (
     !Number.isFinite(mass) ||
-    mass <= INERTIA_MIN_VALID_MASS
+    mass <= INERTIA_MIN_VALID_AREA
   ) {
     return {
       inertiaValid: false,
       inertiaReliable: false,
-      inertiaStatus: `mass too small (${formatMetric(mass)} kg)`,
+      inertiaStatus: `area too small (${formatMetric(mass)} cm^2)`,
     };
   }
 
@@ -1379,17 +2136,83 @@ function pinnedAxisHandednessIsSignificant(
 }
 
 
+function collectSurfaceBodyMetrics(
+  body: adsk.fusion.BRepBody,
+  area: number,
+  topology: {
+    faceCount: number;
+    edgeCount: number;
+  }
+): BodyMetrics {
+  const referencePoint =
+    collectAreaCentroid(body) ??
+    collectBboxCenter(body);
+  const origin = {
+    x: referencePoint.x,
+    y: referencePoint.y,
+    z: referencePoint.z,
+  };
+  const samples =
+    collectSurfaceInertiaSamples(body);
+  const tensor =
+    inertiaTensorFromSamples(samples, origin);
+  const eigen = eigenSymmetric3(tensor);
+  const principalMoments =
+    eigen?.moments ??
+    ([0, 0, 0] as [number, number, number]);
+  const pinnedAxisHandedness = eigen
+    ? pinnedHandednessFromAxes(
+        body,
+        eigen.axes,
+        origin
+      )
+    : 0;
+  const inertiaEvaluation =
+    evaluateInertiaMetrics(
+      sampleWeightSum(samples),
+      principalMoments,
+      Boolean(eigen),
+      Boolean(eigen),
+      referencePoint.source,
+      pinnedAxisHandedness
+    );
+
+  return {
+    isSolid: false,
+    volume: 0,
+    area,
+    faceCount: topology.faceCount,
+    edgeCount: topology.edgeCount,
+    obbExtents: collectObbExtents(body),
+    edgeLengths: collectEdgeLengths(body),
+    referencePoint,
+    faceLayout: collectFaceLayout(
+      body,
+      referencePoint
+    ),
+    principalMoments,
+    mass: 0,
+    inertiaAtCom: tensor,
+    inertiaProductParity:
+      inertiaProductParity(tensor),
+    pinnedAxisHandedness,
+    inertiaValid:
+      inertiaEvaluation.inertiaValid,
+    inertiaReliable:
+      inertiaEvaluation.inertiaReliable,
+    inertiaStatus:
+      inertiaEvaluation.inertiaStatus,
+  };
+}
+
+
 function collectBodyMetrics(
   body: adsk.fusion.BRepBody
 ): BodyMetrics {
+  const isSolid = bodyIsSolid(body);
+  const topology = collectBodyTopology(body);
   let volume = 0;
   let area = 0;
-
-  try {
-    volume = body.volume;
-  } catch {
-    volume = 0;
-  }
 
   try {
     area = body.area;
@@ -1397,12 +2220,30 @@ function collectBodyMetrics(
     area = 0;
   }
 
+  if (!isSolid) {
+    return collectSurfaceBodyMetrics(
+      body,
+      area,
+      topology
+    );
+  }
+
+  try {
+    volume = body.volume;
+  } catch {
+    volume = 0;
+  }
+
   const physicalMetrics =
     collectPhysicalPropertiesMetrics(body);
 
   return {
+    isSolid: true,
     volume,
     area,
+    faceCount: topology.faceCount,
+    edgeCount: topology.edgeCount,
+    edgeLengths: [],
     referencePoint:
       physicalMetrics.referencePoint,
     faceLayout: collectFaceLayout(
@@ -1428,26 +2269,72 @@ function collectBodyMetrics(
 }
 
 
-function bodiesShareVolumeAndArea(
+function bodiesShareBulkMetrics(
   left: BodyMetrics,
   right: BodyMetrics
 ): boolean {
-  return (
-    metricsClose(left.volume, right.volume) &&
-    metricsClose(left.area, right.area)
-  );
+  if (left.isSolid !== right.isSolid) {
+    return false;
+  }
+
+  if (!metricsClose(left.area, right.area)) {
+    return false;
+  }
+
+  if (left.isSolid) {
+    return metricsClose(
+      left.volume,
+      right.volume
+    );
+  }
+
+  if (
+    left.faceCount !== right.faceCount ||
+    left.edgeCount !== right.edgeCount
+  ) {
+    return false;
+  }
+
+  if (
+    left.obbExtents &&
+    right.obbExtents &&
+    !sortedNumbersClose(
+      left.obbExtents,
+      right.obbExtents
+    )
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 
 /**
- * Key for the first-pass bucket: volume and area only.
+ * Key for the first-pass bucket. Solids use volume+area; surface
+ * bodies use area, topology, and oriented-box extents.
  */
 function bulkMetricsKey(
   metrics: BodyMetrics
 ): string {
+  if (metrics.isSolid) {
+    return [
+      "solid",
+      formatMetric(metrics.volume),
+      formatMetric(metrics.area),
+    ].join("|");
+  }
+
+  const extents = metrics.obbExtents
+    ? metrics.obbExtents.map(formatMetric)
+    : ["obb-unknown"];
+
   return [
-    formatMetric(metrics.volume),
+    "surface",
     formatMetric(metrics.area),
+    String(metrics.faceCount),
+    String(metrics.edgeCount),
+    ...extents,
   ].join("|");
 }
 
@@ -1500,19 +2387,35 @@ function bodiesShareShape(
   left: BodyMetrics,
   right: BodyMetrics
 ): boolean {
-  if (!bodiesShareVolumeAndArea(left, right)) {
+  if (!bodiesShareBulkMetrics(left, right)) {
     return false;
   }
 
-  return faceLayoutMatch(
-    left.faceLayout,
-    right.faceLayout
-  );
+  if (
+    !faceLayoutMatch(
+      left.faceLayout,
+      right.faceLayout
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    !left.isSolid &&
+    !sortedNumbersClose(
+      left.edgeLengths,
+      right.edgeLengths
+    )
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 
 /**
- * Same volume/area bucket, same face layout, and same rotation family.
+ * Same bulk metrics, same face layout, and same rotation family.
  * Inertia handedness is checked only when available; otherwise treated as same family.
  */
 function bodiesSameRotationFamily(
@@ -1531,7 +2434,7 @@ function bodiesSameRotationFamily(
 
 
 /**
- * Same volume/area bucket and face layout, with conclusive opposite inertia handedness.
+ * Same bulk metrics and face layout, with conclusive opposite inertia handedness.
  */
 function bodiesAreMirrored(
   left: BodyMetrics,
@@ -1575,34 +2478,47 @@ function formatMetric(value: number): string {
 /**
  * Stable string fingerprint for logging.
  */
+function bodyFingerprintFromMetrics(
+  metrics: BodyMetrics
+): string {
+  const ref = metrics.referencePoint;
+  const extents = metrics.obbExtents
+    ? metrics.obbExtents.map(formatMetric).join(",")
+    : "none";
+
+  return [
+    metrics.isSolid ? "solid" : "surface",
+    formatMetric(metrics.volume),
+    formatMetric(metrics.area),
+    String(metrics.faceCount),
+    String(metrics.edgeCount),
+    extents,
+    ref.source,
+    formatMetric(ref.x),
+    formatMetric(ref.y),
+    formatMetric(ref.z),
+    metrics.principalMoments
+      .map(formatMetric)
+      .join(","),
+    formatMetric(metrics.inertiaAtCom.ixy),
+    formatMetric(metrics.inertiaAtCom.iyz),
+    formatMetric(metrics.inertiaAtCom.ixz),
+    String(metrics.inertiaProductParity),
+    formatMetric(metrics.pinnedAxisHandedness),
+    metrics.inertiaValid ? "valid" : "invalid",
+    metrics.inertiaReliable ? "reliable" : "unreliable",
+    metrics.inertiaStatus,
+  ].join("|");
+}
+
+
 function bodyFingerprint(
   body: adsk.fusion.BRepBody
 ): string {
   try {
-    const metrics =
-      collectBodyMetrics(body);
-    const ref =
-      metrics.referencePoint;
-
-    return [
-      formatMetric(metrics.volume),
-      formatMetric(metrics.area),
-      ref.source,
-      formatMetric(ref.x),
-      formatMetric(ref.y),
-      formatMetric(ref.z),
-      metrics.principalMoments
-        .map(formatMetric)
-        .join(","),
-      formatMetric(metrics.inertiaAtCom.ixy),
-      formatMetric(metrics.inertiaAtCom.iyz),
-      formatMetric(metrics.inertiaAtCom.ixz),
-      String(metrics.inertiaProductParity),
-      formatMetric(metrics.pinnedAxisHandedness),
-      metrics.inertiaValid ? "valid" : "invalid",
-      metrics.inertiaReliable ? "reliable" : "unreliable",
-      metrics.inertiaStatus,
-    ].join("|");
+    return bodyFingerprintFromMetrics(
+      collectBodyMetrics(body)
+    );
   } catch (err) {
     adsk.log(
       `Body fingerprint fallback after error: ${err}`
@@ -2028,11 +2944,13 @@ function buildGlobalBodyExportPlans(
       const metrics =
         collectBodyMetrics(ref.body);
       const fingerprint =
-        bodyFingerprint(ref.body);
+        bodyFingerprintFromMetrics(metrics);
 
       adsk.log(
         `assembly body "${ref.location}" fingerprint: ${fingerprint} ` +
-        `(mass ${formatMetric(metrics.mass)} kg, ` +
+        `(${metrics.isSolid ? "solid" : "surface"}, ` +
+        `mass ${formatMetric(metrics.mass)} kg, ` +
+        `area ${formatMetric(metrics.area)} cm^2, ` +
         `principal moments ${metrics.principalMoments.map(formatMetric).join("/")}, ` +
         `inertia ${metrics.inertiaValid ? "valid" : "invalid"}/` +
         `${metrics.inertiaReliable ? "reliable" : "unreliable"}, ` +
@@ -2054,12 +2972,16 @@ function buildGlobalBodyExportPlans(
   const reliableInertiaCount = entries.filter(
     (entry) => entry.metrics.inertiaReliable
   ).length;
+  const surfaceCount = entries.filter(
+    (entry) => !entry.metrics.isSolid
+  ).length;
 
   adsk.log(
     `Inertia summary: ${validInertiaCount}/${entries.length} body/bodies ` +
-    `have valid mass and principal moments; ` +
+    `have valid principal moments; ` +
     `${reliableInertiaCount}/${entries.length} have reliable axis ` +
-    `handedness for mirror detection.`
+    `handedness for mirror detection; ` +
+    `${surfaceCount} surface body/bodies matched without mass.`
   );
 
   const bulkBuckets = new Map<
@@ -2078,7 +3000,7 @@ function buildGlobalBodyExportPlans(
   }
 
   adsk.log(
-    `Bulk metric buckets (volume+area): ` +
+    `Bulk metric buckets: ` +
     `${bulkBuckets.size} bucket(s) for ${entries.length} body/bodies.`
   );
 
@@ -2120,7 +3042,8 @@ function buildGlobalBodyExportPlans(
     adsk.log(
       `Comparing ${bucket.length} body/bodies ` +
       `in bulk bucket ` +
-      `(volume ${formatMetric(bucket[0].metrics.volume)}, ` +
+      `(${bucket[0].metrics.isSolid ? "solid" : "surface"}, ` +
+      `volume ${formatMetric(bucket[0].metrics.volume)}, ` +
       `area ${formatMetric(bucket[0].metrics.area)}).`
     );
 
@@ -2169,13 +3092,13 @@ function buildGlobalBodyExportPlans(
             `${rightEntry.metrics.inertiaReliable}).`
           );
         } else if (
-          bodiesShareVolumeAndArea(
+          bodiesShareBulkMetrics(
             leftEntry.metrics,
             rightEntry.metrics
           )
         ) {
           adsk.log(
-            `Same volume/area but different shape: ` +
+            `Same bulk metrics but different shape: ` +
             `"${leftEntry.ref.location}" vs ` +
             `"${rightEntry.ref.location}".`
           );
@@ -2324,7 +3247,7 @@ function buildGlobalBodyExportPlans(
 
 /**
  * Maps each export label to other exported parts that are direct mirror
- * variants (same volume/area and face layout, opposite inertia handedness).
+ * variants (same bulk metrics and face layout, opposite inertia handedness).
  * Only pairwise matches are recorded — no transitive linking across parts.
  */
 function buildMirrorPartLinks(
@@ -2362,7 +3285,7 @@ function buildMirrorPartLinks(
       const rightPlan = exportPlans[j];
 
       if (
-        !bodiesShareVolumeAndArea(
+        !bodiesShareBulkMetrics(
           leftPlan.metrics,
           rightPlan.metrics
         )
@@ -2602,6 +3525,10 @@ function exportUnitsToStep(
       matchedBodyNames: unit.matchedBodyNames
         ? [...unit.matchedBodyNames]
         : undefined,
+      boundingBox: collectOrientedBoxDimensions(
+        unit.component,
+        unit.label
+      ),
     });
   }
 
@@ -2620,6 +3547,63 @@ function exportLabelToPartFile(
 }
 
 
+function outputFileBasename(
+  outputFile: string
+): string {
+  return outputFile.replace(/^.*[/\\]/, "");
+}
+
+
+/**
+ * Tight oriented box around B-Rep bodies. Fusion reports length,
+ * width, and height in centimeters.
+ */
+function collectOrientedBoxDimensions(
+  component: adsk.fusion.Component,
+  label: string
+): OrientedBoxDimensions | undefined {
+  try {
+    const box =
+      component.orientedMinimumBoundingBox;
+
+    const length = box.length;
+    const width = box.width;
+    const height = box.height;
+
+    if (
+      !Number.isFinite(length) ||
+      !Number.isFinite(width) ||
+      !Number.isFinite(height)
+    ) {
+      adsk.log(
+        `Oriented bounding box for "${label}" ` +
+        `had non-finite dimensions.`
+      );
+
+      return undefined;
+    }
+
+    adsk.log(
+      `Bounding box for "${label}": ` +
+      `${length} x ${width} x ${height} cm`
+    );
+
+    return {
+      length,
+      width,
+      height,
+    };
+  } catch (err) {
+    adsk.log(
+      `Could not compute oriented bounding box ` +
+      `for "${label}": ${err}`
+    );
+
+    return undefined;
+  }
+}
+
+
 /**
  * Summarizes exported unique parts: output filename, quantity, and
  * assembly locations for each component instance.
@@ -2634,7 +3618,7 @@ function buildPartsManifest(
     )
     .map((entry) => {
       const manifest: PartsManifestEntry = {
-        part: entry.outputFile.replace(/^.*[/\\]/, ""),
+        part: outputFileBasename(entry.outputFile),
         quantity: entry.instanceCount ?? 1,
         locations: entry.matchedBodyNames
           ? [...entry.matchedBodyNames]
@@ -2654,6 +3638,39 @@ function buildPartsManifest(
 
       return manifest;
     });
+}
+
+
+/**
+ * Oriented bounding boxes for leaf parts and split bodies only.
+ * Assemblies and sub-assemblies are omitted.
+ */
+function buildBoundingBoxesDocument(
+  entries: ComponentEntry[]
+): BoundingBoxesDocument {
+  const parts: BoundingBoxEntry[] = [];
+
+  for (const entry of entries) {
+    if (
+      !entry.boundingBox ||
+      (entry.source !== "part" &&
+        entry.source !== "body")
+    ) {
+      continue;
+    }
+
+    parts.push({
+      part: outputFileBasename(entry.outputFile),
+      length: entry.boundingBox.length,
+      width: entry.boundingBox.width,
+      height: entry.boundingBox.height,
+    });
+  }
+
+  return {
+    unit: "cm",
+    parts,
+  };
 }
 
 
@@ -2846,6 +3863,10 @@ function exportPartsToStep(
       source: "part",
       instanceCount: locations.length,
       matchedBodyNames: locations,
+      boundingBox: collectOrientedBoxDimensions(
+        plan.component,
+        plan.label
+      ),
     });
 
     adsk.log(
@@ -3624,14 +4645,33 @@ function run(): void {
     );
 
 
+    const boundingBoxes =
+      buildBoundingBoxesDocument(
+        allComponentEntries
+      );
+
+    const boundingBoxesPath =
+      `${outputDir}/bounding-boxes.json`;
+
+    writeFileSync(
+      boundingBoxesPath,
+      JSON.stringify(boundingBoxes, null, 2)
+    );
+
+    adsk.log(
+      `Wrote ${boundingBoxes.parts.length} ` +
+      `leaf bounding box/boxes to ${boundingBoxesPath}`
+    );
+
+
     let outputZip: string | null = null;
 
     if (allOutputFiles.length > 0) {
       outputZip = "exports.zip";
 
       adsk.log(
-        `Packaging ${allOutputFiles.length} STEP file(s) ` +
-        `and manifest into ${outputZip}`
+        `Packaging ${allOutputFiles.length} STEP file(s), ` +
+        `manifest, and bounding boxes into ${outputZip}`
       );
 
       writeZipArchive(
@@ -3639,6 +4679,7 @@ function run(): void {
         [
           ...allOutputFiles,
           manifestPath,
+          boundingBoxesPath,
         ]
       );
     }
@@ -3676,6 +4717,11 @@ function run(): void {
 
         parts:
           partsManifest,
+
+        boundingBoxesFile:
+          boundingBoxesPath,
+
+        boundingBoxes,
       });
 
 

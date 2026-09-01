@@ -15,6 +15,7 @@ import {
     ensureBucket,
     getInputLocalName,
     getQualifiedActivityId,
+    getSignedOssDownload,
     getThreeLeggedToken,
     getTwoLeggedToken,
     inferInputFormat,
@@ -349,6 +350,24 @@ export async function downloadExportZip(
         requireBucketKey(),
         outputObjectKey,
         destinationPath
+    );
+}
+
+/**
+ * Returns a direct S3 download URL so clients can fetch the zip without
+ * proxying bytes through your backend (fastest option for the website).
+ */
+export async function getExportDownloadUrl(
+    outputObjectKey: string,
+    minutesExpiration = 15
+) {
+    const token = await getTwoLeggedToken();
+
+    return getSignedOssDownload(
+        token,
+        requireBucketKey(),
+        outputObjectKey,
+        minutesExpiration
     );
 }
 
